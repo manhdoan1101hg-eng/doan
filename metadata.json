@@ -1,0 +1,7 @@
+{
+  "name": "JetBot 3D Robotics Simulator",
+  "description": "Mô phỏng 3D chân thực robot JetBot tích hợp NVIDIA Jetson Nano, RPLiDAR, Camera CSI, bo điều khiển vi sai Waveshare và ROS telemetry.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

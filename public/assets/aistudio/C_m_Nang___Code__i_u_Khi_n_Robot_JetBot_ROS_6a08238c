@@ -1,0 +1,230 @@
+# HƯỚNG DẪN & MÃ NGUỒN ĐIỀU KHIỂN ROBOT JETBOT (ROS / PYTHON)
+
+Tài liệu này bao gồm toàn bộ phần mềm và cấu hình cần thiết để điều khiển dòng robot di động vi sai JetBot tích hợp NVIDIA Jetson Nano, bo mạch mở rộng Waveshare, cảm biến RPLiDAR, Camera CSI và mạch ngoại vi LED 7 đoạn.
+
+---
+
+## 1. SƠ ĐỒ KẾT NỐI & CẤU HÌNH PHẦN CỨNG
+
+| Thành phần | Cổng / Chân giao tiếp | Chức năng |
+| :--- | :--- | :--- |
+| **Động cơ Trái / Phải** | Bo Waveshare ROS (I2C / PWM) | Điều khiển hướng và tốc độ robot |
+| **RPLiDAR A1/A2** | `/dev/ttyUSB0` (Baudrate: 115200) | Quét môi trường 2D 360 độ phục vụ SLAM |
+| **Camera CSI** | Cổng FPC (CSI Bus) | Xử lý ảnh / AI / Tracking |
+| **LED 7 đoạn (TM1637)** | GPIO 23 (CLK), GPIO 24 (DIO) | Hiển thị thông số (IP, Pin, Tốc độ) |
+| **Nút bấm (Button)** | GPIO 18 (Pull-Up) | Chuyển chế độ / Reset |
+
+---
+
+## 2. CODE PHẦN 1: ĐIỀU KHIỂN ĐỘNG CƠ HỆ VI SAI (PYTHON)
+
+Tập tin `jetbot_motors.py` quản lý động cơ vi sai thông qua bo điều khiển Waveshare (hoặc driver I2C/PWM PCA9685).
+
+```python
+#!/usr/bin/env python3
+import time
+import board
+import busio
+from adafruit_pca9685 import PCA9685
+
+class JetBotMotors:
+    def __init__(self):
+        # Khởi tạo bus I2C trên Jetson Nano (Bus 1)
+        self.i2c = busio.I2C(board.SCL, board.SDA)
+        self.pca = PCA9685(self.i2c)
+        self.pca.frequency = 50  # Tần số 50Hz cho động cơ PWM
+
+        # Cấu hình kênh PWM cho động cơ
+        # Motor Trái: Kênh 0 (PWM), 1 (IN1), 2 (IN2)
+        # Motor Phải: Kênh 5 (PWM), 3 (IN3), 4 (IN4)
+        self.LEFT_PWM, self.LEFT_IN1, self.LEFT_IN2 = 0, 1, 2
+        self.RIGHT_PWM, self.RIGHT_IN1, self.RIGHT_IN2 = 5, 3, 4
+
+    def _set_motor(self, pwm_pin, in1_pin, in2_pin, speed):
+        """speed từ -1.0 đến 1.0"""
+        speed = max(-1.0, min(1.0, speed))
+        duty_cycle = int(abs(speed) * 65535)
+
+        if speed > 0:
+            self.pca.channels[in1_pin].duty_cycle = 65535
+            self.pca.channels[in2_pin].duty_cycle = 0
+        elif speed < 0:
+            self.pca.channels[in1_pin].duty_cycle = 0
+            self.pca.channels[in2_pin].duty_cycle = 65535
+        else:
+            self.pca.channels[in1_pin].duty_cycle = 0
+            self.pca.channels[in2_pin].duty_cycle = 0
+
+        self.pca.channels[pwm_pin].duty_cycle = duty_cycle
+
+    def set_speeds(self, left_speed, right_speed):
+        self._set_motor(self.LEFT_PWM, self.LEFT_IN1, self.LEFT_IN2, left_speed)
+        self._set_motor(self.RIGHT_PWM, self.RIGHT_IN1, self.RIGHT_IN2, right_speed)
+
+    def stop(self):
+        self.set_speeds(0, 0)
+
+if __name__ == "__main__":
+    robot = JetBotMotors()
+    print("Tiến...")
+    robot.set_speeds(0.5, 0.5)
+    time.sleep(2)
+    print("Xoay Tải...")
+    robot.set_speeds(-0.4, 0.4)
+    time.sleep(1)
+    print("Dừng.")
+    robot.stop()
+```
+
+---
+
+## 3. CODE PHẦN 2: HIỂN THỊ MẠCH LED 7 ĐOẠN TM1637 & NÚT BẤM
+
+Tập tin `peripheral_control.py` điều khiển mô-đun LED 7 đoạn hiển thị thông số và đọc nút bấm ngắt GPIO trên breadboard.
+
+```python
+#!/usr/bin/env python3
+import RPi.GPIO as GPIO
+import time
+
+# Chân kết nối GPIO trên Jetson Nano
+CLK_PIN = 23
+DIO_PIN = 24
+BTN_PIN = 18
+
+class TM1637Display:
+    def __init__(self, clk, dio):
+        self.clk = clk
+        self.dio = dio
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(self.clk, GPIO.OUT)
+        GPIO.setup(self.dio, GPIO.OUT)
+
+    def _start(self):
+        GPIO.output(self.dio, GPIO.HIGH)
+        GPIO.output(self.clk, GPIO.HIGH)
+        GPIO.output(self.dio, GPIO.LOW)
+        GPIO.output(self.clk, GPIO.LOW)
+
+    def _stop(self):
+        GPIO.output(self.clk, GPIO.LOW)
+        GPIO.output(self.dio, GPIO.LOW)
+        GPIO.output(self.clk, GPIO.HIGH)
+        GPIO.output(self.dio, GPIO.HIGH)
+
+    def _write_byte(self, b):
+        for i in range(8):
+            GPIO.output(self.clk, GPIO.LOW)
+            GPIO.output(self.dio, GPIO.HIGH if (b & (1 << i)) else GPIO.LOW)
+            GPIO.output(self.clk, GPIO.HIGH)
+        GPIO.output(self.clk, GPIO.LOW)
+        GPIO.output(self.dio, GPIO.HIGH)
+        GPIO.output(self.clk, GPIO.HIGH)
+        GPIO.setup(self.dio, GPIO.IN)
+        # Ack check
+        GPIO.setup(self.dio, GPIO.OUT)
+
+    def show_num(self, val):
+        """Hiển thị số nguyên 4 chữ số (ví dụ: 1234)"""
+        digits = [
+            0x3f, 0x06, 0x5b, 0x4f, 0x66, 
+            0x6d, 0x7d, 0x07, 0x7f, 0x6f
+        ]
+        s = f"{val:04d}"
+        self._start()
+        self._write_byte(0x40) # Tự động tăng địa chỉ
+        self._stop()
+
+        self._start()
+        self._write_byte(0xc0) # Bắt đầu từ ô 0
+        for char in s:
+            num = int(char)
+            self._write_byte(digits[num])
+        self._stop()
+
+        self._start()
+        self._write_byte(0x88 + 7) # Bật LED, độ sáng tối đa
+        self._stop()
+
+def button_callback(channel):
+    print("Nút bấm trên Breadboard đã được nhấn!")
+
+if __name__ == "__main__":
+    display = TM1637Display(CLK_PIN, DIO_PIN)
+    GPIO.setup(BTN_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.add_event_detect(BTN_PIN, GPIO.FALLING, callback=button_callback, braintime=300)
+
+    print("Đang hiển thị số 2026...")
+    display.show_num(2026)
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        GPIO.cleanup()
+```
+
+---
+
+## 4. CẤU HÌNH ROS LAUNCH & BRIDGE (`jetbot_bringup.launch`)
+
+Tập tin Launch cho ROS 1 (Noetic/Melodic) giúp bật đồng thời phần cứng robot, cảm biến RPLiDAR và Camera CSI.
+
+```xml
+<launch>
+    <!-- 1. Node điều khiển động cơ JetBot từ lệnh /cmd_vel -->
+    <node name="jetbot_driver" pkg="jetbot_ros" type="jetbot_motors_node.py" output="screen">
+        <param name="linear_speed_scale" value="0.5"/>
+        <param name="angular_speed_scale" value="1.0"/>
+    </node>
+
+    <!-- 2. Khởi chạy cảm biến RPLiDAR A1/A2 -->
+    <node name="rplidarNode" pkg="rplidar_ros" type="rplidarNode" output="screen">
+        <param name="serial_port" type="string" value="/dev/ttyUSB0"/>
+        <param name="serial_baudrate" type="int" value="115200"/>
+        <param name="frame_id" type="string" value="laser_frame"/>
+        <param name="inverted" type="bool" value="false"/>
+        <param name="angle_compensate" type="bool" value="true"/>
+    </node>
+
+    <!-- 3. Khởi chạy Camera CSI GStreamer ROS Node -->
+    <node name="csi_camera" pkg="jetson_camera" type="jetson_camera_node" output="screen">
+        <param name="cap_width" value="1280"/>
+        <param name="cap_height" value="720"/>
+        <param name="framerate" value="30"/>
+        <param name="frame_id" value="camera_frame"/>
+    </node>
+
+    <!-- 4. Khai báo tọa độ khung hình (Static Transform Publisher) -->
+    <node pkg="tf" type="static_transform_publisher" name="base_to_laser" 
+          args="0.0 0.0 0.18 0 0 0 base_link laser_frame 100" />
+          
+    <node pkg="tf" type="static_transform_publisher" name="base_to_camera" 
+          args="0.10 0.0 0.08 0 0 0 base_link camera_frame 100" />
+</launch>
+```
+
+---
+
+## 5. LỆNH VẬN HÀNH VÀ KIỂM TRA THỰC TẾ
+
+1. **Cấp quyền truy cập cổng kết nối TTY (LiDAR & I2C):**
+   ```bash
+   sudo chmod 666 /dev/ttyUSB0
+   sudo chmod 666 /dev/i2c-1
+   ```
+
+2. **Chạy hệ thống điều khiển ROS:**
+   ```bash
+   roslaunch jetbot_ros jetbot_bringup.launch
+   ```
+
+3. **Điều khiển robot bằng bàn phím (Teleop):**
+   ```bash
+   rosrun teleop_twist_keyboard teleop_twist_keyboard.py
+   ```
+
+4. **Chạy SLAM lập bản đồ không gian:**
+   ```bash
+   roslaunch rplidar_ros gmapping_demo.launch
+   ```
